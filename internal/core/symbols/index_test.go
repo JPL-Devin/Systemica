@@ -66,6 +66,89 @@ func TestIndexOwnedMemberShadowsWildcardReexport(t *testing.T) {
 	}
 }
 
+// Wildcard imports chain — KerML imports Kernel::*, Kernel imports Core::*,
+// Core imports Root::* — and each link names a sibling of the importing
+// package, so expansion has to follow the chain to its end and look the target
+// up in the enclosing namespaces, not only in the importer and the root. The
+// answer must not depend on the order the importers happen to be visited in.
+func TestExpandWildcardImportsChainsAndIsOrderIndependent(t *testing.T) {
+	const src = `package L {
+		public import Mid::*;
+		package Base { part def Element; attribute def <kg> Kilogram; }
+		package Mid { public import Base::*; }
+	}`
+	want := []string{"L::Base::Element", "L::Mid::Element", "L::Element", "L::kg", "L::Mid::kg"}
+
+	// Repeat: the pass walks a map, so a single run could pass by luck.
+	for i := 0; i < 8; i++ {
+		idx := NewIndex()
+		addDoc(t, idx, "l.sysml", src)
+		idx.ExpandWildcardImports()
+		for _, fqn := range want {
+			if got := len(idx.LookupQualified(fqn)); got != 1 {
+				t.Fatalf("run %d: LookupQualified(%s) len = %d, want 1", i, fqn, got)
+			}
+		}
+	}
+}
+
+// A relative wildcard target names the innermost enclosing declaration of that
+// name, not a top-level package that happens to share it.
+func TestExpandWildcardImportsPrefersTheEnclosingTarget(t *testing.T) {
+	idx := NewIndex()
+	addDoc(t, idx, "outer.sysml", "package Systems { part def Outer; }")
+	addDoc(t, idx, "sysml.sysml", "package SysML { public import Systems::*; package Systems { part def Inner; } }")
+	idx.ExpandWildcardImports()
+
+	if got := len(idx.LookupQualified("SysML::Inner")); got != 1 {
+		t.Errorf("LookupQualified(SysML::Inner) len = %d, want 1", got)
+	}
+	if got := len(idx.LookupQualified("SysML::Outer")); got != 0 {
+		t.Errorf("LookupQualified(SysML::Outer) len = %d, want 0: "+
+			"SysML::Systems shadows the top-level Systems", got)
+	}
+}
+
+// A wildcard import must resolve to a package that actually declares members,
+// not to a synthetic key an earlier import produced by re-exporting a
+// same-named subpackage. Here P imports both Outer::* (which re-exports its
+// child package Shared into P as P::Shared) and Shared::* (the top-level one).
+// P::Shared has no subtree, so resolving `import Shared::*` to it would bring
+// in nothing; it must resolve to the real top-level Shared instead.
+func TestExpandWildcardImportsIgnoresSyntheticTarget(t *testing.T) {
+	idx := NewIndex()
+	addDoc(t, idx, "shared.sysml", "package Shared { part def Widget; }")
+	addDoc(t, idx, "outer.sysml", "package Outer { package Shared { part def Ignored; } }")
+	addDoc(t, idx, "p.sysml", "package P { public import Outer::*; public import Shared::*; }")
+	idx.ExpandWildcardImports()
+
+	if got := len(idx.LookupQualified("P::Widget")); got != 1 {
+		t.Errorf("LookupQualified(P::Widget) len = %d, want 1: "+
+			"import Shared::* must resolve to the top-level Shared, "+
+			"not the re-exported P::Shared", got)
+	}
+}
+
+// A declared package stays a usable wildcard target when an import re-exported
+// something of the same name alongside it — the declaration shadows the
+// re-export, as it does for any lookup.
+func TestExpandWildcardImportsTargetSurvivesAReexportOfItsName(t *testing.T) {
+	idx := NewIndex()
+	addDoc(t, idx, "base.sysml", "package Base { package Util { part def FromBase; } }")
+	addDoc(t, idx, "lib.sysml", "package Lib { public import Base::*; "+
+		"package Util { part def A; } package Sub { public import Util::*; } }")
+	idx.ExpandWildcardImports()
+
+	if got := len(idx.LookupQualified("Lib::Sub::A")); got != 1 {
+		t.Errorf("LookupQualified(Lib::Sub::A) len = %d, want 1: "+
+			"`import Util::*` names Lib's own Util", got)
+	}
+	if got := len(idx.LookupQualified("Lib::Sub::FromBase")); got != 0 {
+		t.Errorf("LookupQualified(Lib::Sub::FromBase) len = %d, want 0: "+
+			"Lib::Util shadows the re-exported Base::Util", got)
+	}
+}
+
 func TestIndexDocumentRoot(t *testing.T) {
 	idx := NewIndex()
 	addDoc(t, idx, "a.sysml", "package P;")
